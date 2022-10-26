@@ -1,0 +1,186 @@
+library(baseballr)
+
+# This is scraping all pitching and hitting data from the post season thus far
+# May cause an error if the data you are scraping is too large; typically keep it to 5 day intervals
+
+postData = scrape_statcast_savant(start_date = "2022-10-07",
+                                  end_date = "2022-10-24",
+                                  player_type = "pitcher")
+
+batter = scrape_statcast_savant(start_date = "2022-10-07",
+                                end_date = "2022-10-24",
+                                player_type = "batter")
+
+library(dplyr)
+
+# Aggregating to get player ID numbers
+
+batterID = batter %>%
+  group_by(player_name) %>%
+  summarize(batter = mean(batter))
+
+# Getting the hitter names in the file
+
+joined = left_join(postData, batterID, by = "batter")
+
+library(stringr)
+
+# Another way to do this, much quicker and less cumbersome
+
+joined2 = postData %>%
+  mutate(hitter = word(postData$des, 1, 2, sep = " "))
+
+rm(batter, batterID, joined, postData)
+
+# Selecting data that we are interested in
+
+pitcher = joined2 %>%
+  select(player_name, p_throws, release_speed, release_spin_rate, pitch_type, 
+         pfx_x, pfx_z, plate_x, plate_z, woba_value, delta_run_exp, estimated_woba_using_speedangle)
+
+# leaderboard for velocity
+
+pitcher %>%
+  group_by(player_name, pitch_type) %>%
+  summarize(n = n(),
+            velocity = mean(release_speed),
+            xMov = abs(mean(pfx_x)),
+            zMov = mean(pfx_z)) %>%
+  arrange(desc(velocity)) %>%
+  filter(n >= 5) %>%
+  head()
+
+# Leaderboard for run expectancy added for right handed sliders
+
+pitcher %>%
+  filter(p_throws == "R" & pitch_type == "SL") %>%
+  group_by(player_name) %>%
+  summarize(n = n(),
+            velo = mean(release_speed),
+            xMov = mean(pfx_x),
+            zMov = mean(pfx_z),
+            wOBAcon = mean(woba_value, na.rm = T),
+            REA = sum(delta_run_exp),
+            RE = mean(delta_run_exp, na.rm = T)) %>%
+  filter(n >= 10) %>%
+  arrange(REA)
+
+# Leaders for whiff%
+
+leaders = joined2 %>%
+  filter(description %in% c("swinging_strike_blocked", "swinging_strike", "foul", "hit_into_play")) %>%
+  mutate(whiff = if_else(description %in% c("swinging_strike_blocked", "swinging_strike"), 1, 0)) %>%
+  filter(pitch_type == "SL") %>%
+  group_by(player_name) %>%
+  summarize(n = n(),
+            velo = mean(release_speed),
+            xMov = abs(mean(pfx_x)),
+            zMov = mean(pfx_z),
+            wOBAcon = mean(woba_value, na.rm = T),
+            REA = sum(delta_run_exp),
+            RE = mean(delta_run_exp, na.rm = T),
+            whiffP = sum(whiff) / n) %>%
+  filter(n >= 10) %>%
+  arrange(desc(whiffP)) %>%
+  ungroup() %>%
+  head(5)
+leaders
+
+library(ggplot2)  
+
+# Boxplot for velocity and pitchtype
+
+ggplot(pitcher, aes(x = pitch_type, y = release_speed, fill = pitch_type)) +
+  geom_boxplot()
+
+# Plot for velocity and spin rate for fastballs
+
+ggplot(filter(pitcher, pitch_type == "FF"), aes(release_speed, release_spin_rate)) +
+  geom_point() +
+  stat_smooth(method = "lm", se = F, size = 2) #+
+  #theme_bw() +
+  #labs(x = "Velocity", y = "Spin Rate", title = "Velocity VS Spin Rate Plot", 
+       #caption = "UMN Sports Analytics Club, October 26, 2022", 
+       #subtitle = "Represents Bauer Units")
+
+# Movement by pitch type plot
+
+ggplot(joined2, aes(pfx_x, pfx_z, color = pitch_type)) + # catcher view
+  geom_point() +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0) +
+  theme_bw() +
+  labs(x = "X Movement", y = "Z Movement", color = "Pitch Type")
+
+  
+# Slider leader movement locations
+
+ggplot(leaders, aes(xMov, zMov)) +
+  geom_point() +
+  xlim(-.5, 1.5) +
+  ylim(-.25, 0.75) +
+  geom_vline(xintercept = 0) +
+  geom_hline(yintercept = 0) +
+  theme_bw() +
+  labs(x = "X Movement", y = "Z Movement") +
+  geom_text(aes(label=player_name))
+
+
+# Selected data for building a Stuff+ model
+
+stuffData = joined2 %>%
+  select(player_name, hitter, pitch_type, game_date, inning, inning_topbot, hitter, balls, strikes, 
+         outs_when_up, pfx_x, pfx_z, release_speed, release_pos_x, release_pos_z, release_pos_y, delta_run_exp, woba_value)
+
+# Linear regression
+
+lm = lm(delta_run_exp ~ pfx_x + pfx_z + release_speed + release_pos_x + release_pos_z + release_pos_y, data = stuffData)
+summary(lm)
+
+library(randomForest)
+
+# Looking at the data
+
+summary(stuffData)
+
+
+# Getting rid of NA's in the data
+
+randFdata = stuffData %>% 
+  filter(!is.na(delta_run_exp))
+
+# Running a random forest
+
+rf = randomForest(delta_run_exp ~ pfx_x + pfx_z + release_speed + release_pos_x + release_pos_z + release_pos_y, data = randFdata, 
+                  ntrees = 50)
+summary(rf)
+
+# Predicting the data using model
+
+rfpreds = predict(rf, newdata = randFdata)
+
+rf2 = cbind(randFdata, rfpreds)
+
+library(Metrics)
+
+sd(rf2$delta_run_exp)
+rmse(rf2$delta_run_exp, rf2$rfpreds)
+
+cor(rf2$delta_run_exp, rf2$rfpreds) ^2
+
+
+rf2 %>%
+  group_by(player_name) %>%
+  summarize(n = n(),
+            rfpreds = mean(rfpreds)) %>%
+  arrange(rfpreds) %>%
+  filter(n >= 100) %>%
+  tail()
+
+rf2 %>%
+  group_by(player_name, pitch_type) %>%
+  summarize(n = n(),
+            rfpreds = mean(rfpreds)) %>%
+  arrange(rfpreds) %>%
+  filter(n >= 50) %>%
+  tail()  
